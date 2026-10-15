@@ -1,9 +1,8 @@
-From 25b6c5a5910ad243bc98180c9aba1b06d950d8f9 Mon Sep 17 00:00:00 2001
+From 46508ed99db9175128928ca0666324861bbdd6ec Mon Sep 17 00:00:00 2001
 From: loke <LokeLoki@users.noreply.github.com>
-Date: Thu, 15 Oct 2026 00:07:51 -0500
-Subject: [PATCH] local(v3.3-v3.4.4): compaction patch chain - output contract,
- hardened micro (v3.4), 10k ceiling (v3.4.1), live-counter stamping (v3.4.2),
- fold resets micro cadence (v3.4.3), micro reclaim floor (v3.4.4)
+Date: Thu, 15 Oct 2026 00:33:17 -0500
+Subject: [PATCH] local(v3.3-v3.4.5): compaction patch chain - adds v3.4.5
+ short-heading eviction fix + mojibake scrub
 
 ---
  agent/agent_init.py         |   5 +
@@ -35,7 +34,7 @@ index 57b84fac89..4ae36f7078 100644
          if hasattr(_cc, _attr):
              setattr(_cc, _attr, _value)
 diff --git a/agent/context_compressor.py b/agent/context_compressor.py
-index 13b1d4a08b..dd108b7edd 100644
+index 13b1d4a08b..9bc020f925 100644
 --- a/agent/context_compressor.py
 +++ b/agent/context_compressor.py
 @@ -818,6 +818,17 @@ _MIN_SUMMARY_TOKENS = 2000
@@ -253,9 +252,9 @@ index 13b1d4a08b..dd108b7edd 100644
 +
 +        evicted = 0
 +        for prefix, keep in (
-+            (_LEAN_SESSION_LOG_HEADING, 6),
++            ("## Detailed Session Log", 6),
 +            ("## Completed Actions", 10),
-+            (_LEAN_ANCHOR_HEADING, 12),
++            ("## Anchor Index", 12),
 +        ):
 +            if len(summary) <= ceiling_chars:
 +                break
@@ -489,7 +488,7 @@ index 13b1d4a08b..dd108b7edd 100644
      def _with_summary_prefix(cls, summary: str) -> str:
          """Normalize summary text to the current compaction handoff format."""
 diff --git a/agent/micro_compaction.py b/agent/micro_compaction.py
-index 42cad0c2d8..1fef039336 100644
+index 42cad0c2d8..6ddbfb5902 100644
 --- a/agent/micro_compaction.py
 +++ b/agent/micro_compaction.py
 @@ -97,10 +97,12 @@ class MicroCompactionMixin:
@@ -552,7 +551,7 @@ index 42cad0c2d8..1fef039336 100644
 +    def _micro_rolling_ceiling_tokens(self) -> int:
 +        """Ceiling for the rolling memo: under the batch handoff ceiling AND under half the micro
 +        call's output budget, so a merge can always rewrite the whole doc (a length-stopped merge
-+        is discarded, which would permanently stall absorption). Reads cached values only â this
++        is discarded, which would permanently stall absorption). Reads cached values only — this
 +        runs inside finalize_turn, where the lazy context properties could fire a sync probe."""
 +        cc = _cc()
 +        ctx = getattr(self, "_resolved_context_length", 0) or 0
@@ -574,7 +573,7 @@ index 42cad0c2d8..1fef039336 100644
 +            ceiling_tokens = self._micro_rolling_ceiling_tokens()
 +            doc = self._cap_summary_handoff(doc, ceiling_tokens=ceiling_tokens)
 +            # The marker wrapper supplies the snapshot heading; a model emitting it anyway would
-+            # double it in the marker and break rfind rehydration â drop the inner copy.
++            # double it in the marker and break rfind rehydration — drop the inner copy.
 +            if doc.startswith(cc.HISTORICAL_TASK_HEADING):
 +                doc = doc[len(cc.HISTORICAL_TASK_HEADING):].strip()
 +            ceiling_chars = ceiling_tokens * 4
