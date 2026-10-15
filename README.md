@@ -42,6 +42,10 @@ what's stale) is left to the summarizer. The model never gets a vote on a
 number or an identifier. That split is what makes each fold a verifiable
 snapshot instead of a game of telephone.
 
+Why the thresholds are what they are — the measured cache-break economics,
+the full 18-pass micro telemetry, the dead-knob list, and the traps for
+re-implementers — is written up in **[DESIGN.md](DESIGN.md)**.
+
 ---
 
 ## How to apply
