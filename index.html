@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>hermes-compaction v3.4.1 — patch artifact</title>
+<title>hermes-compaction v3.4.4 — patch artifact</title>
 <style>
   :root { color-scheme: dark; }
   body { font: 15px/1.6 ui-sans-serif, system-ui, sans-serif; margin: 0; background: #0d1117; color: #e6edf3; }
@@ -23,15 +23,25 @@
 </head>
 <body>
 <div class="wrap">
-  <h1>hermes-compaction v3.4.1</h1>
-  <div class="sub">Local patch chain for Hermes Agent's context compressor: output contract enforced at both summary cadences, iterative decay, ONE-HOME dedup, handoff ceiling 10k, hardened micro-compaction. Two files, 357+ / 11−.</div>
+  <h1>hermes-compaction v3.4.4</h1>
+  <div class="sub">Local patch chain for Hermes Agent's context compressor: output contract at both summary cadences, ONE-HOME dedup, handoff ceiling 10k, hardened micro-compaction, machine-stamped live session counters, fold-resets-cadence, and a measured micro reclaim floor. Three files, 439+ / 14−. Base commit <code>71d34bad10</code> (v0.21.x era).</div>
   <div class="cards">
     <a class="btn" href="compressorpatch.patch" download>Download patch</a>
     <a class="btn" href="compressorpatch.patch">Raw file</a>
   </div>
   <h2>Apply against stock Hermes</h2>
-  <p>From the root of a checkout of the base commit:<br>
+  <p>From the root of a checkout of the base commit <code>71d34bad10</code>:<br>
   <code>git apply compressorpatch.patch</code></p>
+  <p class="meta">If an earlier hermes-compaction patch is applied, revert first (<code>git checkout -- agent/context_compressor.py agent/micro_compaction.py agent/agent_init.py</code>) and apply this one instead — it supersedes v3.3/v3.4.1.</p>
+  <h2>Recommended compression settings</h2>
+  <p>The patch is behavior-neutral by default (defaults = stock). To run the tuned stack (same band this chain was developed in: a 200k window breathing 80–135k), add to <code>config.yaml</code>:</p>
+  <pre>compression:
+  micro_compact: true
+  micro_compact_every_n_turns: 6            # cadence arms ~2.8x/runway; each pass buys ~2.5 turns
+  micro_compact_min_reclaim_tokens: 2500    # v3.4.4 floor: absorb must measure >=2.5k reclaim to commit
+  context_timeout_seconds: 240              # fold watchdog headroom under the 300s aux budget
+  micro_compact_defrag_threshold_tokens: 20000  # leave high: memo ceiling (3000) governs first</pre>
+  <p class="meta">sha256 3e3c600b&hellip; &middot; 439 insertions / 14 deletions &middot; verified: clean <code>git apply</code> at base, compiles, feature assertions pass against the patched tree.</p>
   <div class="meta" id="meta"></div>
   <pre id="patch">Loading patch…</pre>
 </div>

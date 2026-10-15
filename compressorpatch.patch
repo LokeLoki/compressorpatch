@@ -1,17 +1,41 @@
-From 39dc2cd56ff565d556bcf8eb018133d23f1d2adb Mon Sep 17 00:00:00 2001
+From 25b6c5a5910ad243bc98180c9aba1b06d950d8f9 Mon Sep 17 00:00:00 2001
 From: loke <LokeLoki@users.noreply.github.com>
-Date: Wed, 14 Oct 2026 02:12:23 -0500
-Subject: [PATCH] local(v3.3+v3.4.1): compaction hardening - output contract,
- iterative decay, canonical heading backstop, ONE-HOME dedup, handoff ceiling
- 10k, session-id pointers, micro guard + HARDENED micro-compaction
+Date: Thu, 15 Oct 2026 00:07:51 -0500
+Subject: [PATCH] local(v3.3-v3.4.4): compaction patch chain - output contract,
+ hardened micro (v3.4), 10k ceiling (v3.4.1), live-counter stamping (v3.4.2),
+ fold resets micro cadence (v3.4.3), micro reclaim floor (v3.4.4)
 
 ---
- agent/context_compressor.py | 298 +++++++++++++++++++++++++++++++++++-
- agent/micro_compaction.py   |  70 ++++++++-
- 2 files changed, 357 insertions(+), 11 deletions(-)
+ agent/agent_init.py         |   5 +
+ agent/context_compressor.py | 353 +++++++++++++++++++++++++++++++++++-
+ agent/micro_compaction.py   |  95 +++++++++-
+ 3 files changed, 439 insertions(+), 14 deletions(-)
 
+diff --git a/agent/agent_init.py b/agent/agent_init.py
+index 57b84fac89..4ae36f7078 100644
+--- a/agent/agent_init.py
++++ b/agent/agent_init.py
+@@ -1584,6 +1584,10 @@ def _parse_compression_config(agent, _agent_cfg) -> CompressionSettings:
+         micro_compact_defrag_tokens=max(
+             1, _parse_config_int(cfg.get("micro_compact_defrag_threshold_tokens", 2000), 2000)
+         ),
++        # v3.4.4: minimum measured token reclaim for a micro absorb to commit (0 = stock behavior).
++        micro_compact_min_reclaim_tokens=max(
++            0, _parse_config_int(cfg.get("micro_compact_min_reclaim_tokens", 0), 0)
++        ),
+         codex_app_server_auto=app_server_auto,
+         codex_responses_native=responses_native,
+         codex_responses_compact_threshold=compact_threshold,
+@@ -2021,6 +2025,7 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
+         ("_micro_compact_enabled", cs.micro_compact),
+         ("_micro_compact_every_n_turns", cs.micro_compact_every_n_turns),
+         ("_micro_compact_defrag_threshold_tokens", cs.micro_compact_defrag_tokens),
++        ("_micro_compact_min_reclaim_tokens", cs.micro_compact_min_reclaim_tokens),
+     ):
+         if hasattr(_cc, _attr):
+             setattr(_cc, _attr, _value)
 diff --git a/agent/context_compressor.py b/agent/context_compressor.py
-index 13b1d4a08b..5672401de2 100644
+index 13b1d4a08b..dd108b7edd 100644
 --- a/agent/context_compressor.py
 +++ b/agent/context_compressor.py
 @@ -818,6 +818,17 @@ _MIN_SUMMARY_TOKENS = 2000
@@ -62,7 +86,29 @@ index 13b1d4a08b..5672401de2 100644
          collected.append("> " + text.replace("\n", "\n> "))
          used += len(text)
      if not collected:
-@@ -3684,13 +3699,116 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
+@@ -2169,6 +2184,11 @@ class ContextCompressor(
+         self._micro_compact_rolling_summary = ""
+         self._micro_compact_consecutive_failures = 0
+         self._micro_compact_last_failure_cursor = -1
++        # The cadence clock rode across folds, so the Nth counted turn could land right AFTER a big
++        # compression: handoff re-prefill and a micro splice stacked as two cache breaks on adjacent
++        # turns (observed: 8-pass chain fired at 42.9% occupancy, right after a fold). Post-fold,
++        # micro's first dig must wait a full fresh cadence over the rebuilt window.
++        self._micro_compact_turns_since_pass = 0
+ 
+     def _emit_init_summary_once(self) -> None:
+         """Emit the init log line once, on first context-length resolution (keeps __init__ non-blocking)."""
+@@ -2857,6 +2877,9 @@ class ContextCompressor(
+         self._micro_compact_enabled = False
+         self._reset_micro_compact_cursor_state()
+         self._micro_compact_defrag_threshold_tokens = 2000
++        # v3.4.4: minimum MEASURED token reclaim for a micro absorb to commit (0 = floor disabled,
++        # stock behavior). Set from compression.micro_compact_min_reclaim_tokens via agent_init.
++        self._micro_compact_min_reclaim_tokens: int = 0
+         # Set when _defrag_rolling_summary pops _DB_PERSISTED_MARKER in place; finalize_turn resets the flush cursor.
+         # Set by _defrag_rolling_summary when it pops _DB_PERSISTED_MARKER from a live dict in place;
+         # consumed by finalize_turn to invalidate the agent's bounded flush-scan cursor (sibling of the
+@@ -3684,13 +3707,158 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
              return summary
          for heading, build in (
              (_LEAN_ANCHOR_HEADING, lambda: _redact_compaction_text(_build_anchor_index(turns_to_summarize))),
@@ -74,6 +120,48 @@ index 13b1d4a08b..5672401de2 100644
                  summary += build()
          return summary
  
++    _LIVE_COUNTERS_MARKER = "Live session counters (machine-stamped"
++
++    def _ground_session_facts(self, summary: str) -> str:
++        """Stamp exact live per-session counters into Active State, replacing any stale copy.
++
++        The summarizer only ever sees the eviction window plus its own previous handoff; the usage
++        row lives in the protected tail, never in the fold's input — so inherited counters
++        ("5.3M tokens, 31.3h") drift forward silently across folds, un-quarantinable because nothing
++        in the fold's input contradicts them. Deterministic post-generation write closes that loop.
++        Active State is never evicted by the cap, so the line survives. Best-effort: any failure
++        returns the summary untouched.
++        """
++        try:
++            db = getattr(self, "_session_db", None)
++            sid = getattr(self, "_session_id", "") or ""
++            if db is None or not sid:
++                return summary
++            row = db.get_session(sid) if hasattr(db, "get_session") else None
++            if not isinstance(row, dict):
++                return summary
++            inp = int(row.get("input_tokens") or 0)
++            out = int(row.get("output_tokens") or 0)
++            mc = int(db.message_count(sid)) if hasattr(db, "message_count") else int(row.get("message_count") or 0)
++            started = float(row.get("started_at") or 0.0)
++            hours = f"{(time.time() - started) / 3600.0:.1f}h" if started > 0 else "unknown h"
++            line = (
++                f"- ⚙ {self._LIVE_COUNTERS_MARKER}): {inp + out:,} tokens "
++                f"({inp:,} in / {out:,} out), {mc:,} messages, {hours} since session start. "
++                "Machine-stamped from the session DB at fold time — this line is current truth; "
++                "never replace it with numbers copied from earlier handoffs."
++            )
++            # Idempotent: drop any previously stamped line (across iterative updates), then insert fresh.
++            summary = re.sub(rf"^\s*[-*]?\s*⚙?\s*{re.escape(self._LIVE_COUNTERS_MARKER)}.*$\n?", "", summary, flags=re.M)
++            m = re.search(r"^##\s+Active State:?\s*$", summary, flags=re.M)
++            if m:
++                pos = m.end()
++                return summary[:pos] + "\n" + line + summary[pos:]
++            return summary + f"\n\n## Active State\n{line}\n"
++        except Exception as exc:
++            logger.debug("session-fact grounding failed: %s", exc)
++            return summary
++
 +    def _cap_summary_handoff(self, summary: str, ceiling_tokens: int | None = None) -> str:
 +        """Deterministic hard cap for the assembled handoff so iterative updates can't let the
 +        index outgrow its usefulness (observed: ~4K → ~19K chars over 13 generations, no ceiling).
@@ -180,7 +268,7 @@ index 13b1d4a08b..5672401de2 100644
      @classmethod
      def _bound_summary_input(cls, content: str) -> str:
          """Cap total summarizer input, keeping head and tail and marking the omitted middle."""
-@@ -3974,6 +4092,60 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
+@@ -3974,6 +4142,60 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
              )
          return content
  
@@ -241,7 +329,7 @@ index 13b1d4a08b..5672401de2 100644
      def _generate_summary(
          self, turns_to_summarize: list[dict[str, Any]], focus_topic: Optional[str] = None,
          memory_context: str = "", bypass_cooldown: bool = False,
-@@ -4019,11 +4191,21 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
+@@ -4019,11 +4241,26 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
              content = strip_think_blocks(None, content).strip() or content
              # The summarizer may echo secrets verbatim; redact the output too.
              summary = _redact_compaction_text(content.strip())
@@ -257,22 +345,27 @@ index 13b1d4a08b..5672401de2 100644
              summary = _reinject_pruned_skill_markers(summary, _pruned_skill_names)
              summary = self._ground_historical_task_snapshot(summary, turns_to_summarize)
              summary = self._augment_summary_lean(summary, turns_to_summarize)
++            # Live per-session counters: the summarizer only ever sees the eviction window plus its own
++            # previous handoff, so inherited Active State counters ("5.3M tokens, 31.3h") drift forward
++            # silently — the usage row lives in the protected tail, never in the fold's input. Stamp
++            # exact numbers post-generation; Active State is never evicted by the cap below.
++            summary = self._ground_session_facts(summary)
 +            # Hard ceiling: lean augmentation can push the handoff past its
 +            # usefulness as the previous summary re-feeds each iterative update.
 +            summary = self._cap_summary_handoff(summary)
              self._validate_summary_user_provenance(summary, has_user_turn)
              # A detached stale attempt must not publish its late summary onto shared compressor state:
              # the fallback already advanced _previous_summary and owns the cooldown/error fields. The
-@@ -4078,7 +4260,7 @@ PREVIOUS SUMMARY:
+@@ -4078,7 +4315,7 @@ PREVIOUS SUMMARY:
  NEW TURNS TO INCORPORATE:
  {content_to_summarize}{_memory_section}
  
 -Update the summary using this exact structure. PRESERVE all existing information that is still relevant. ADD new completed actions to the numbered list (continue numbering). Move items from "In Progress" to "Completed Actions" when done. Move answered questions to "Resolved Questions". Update "Active State" to reflect current state. Remove information only if it is clearly obsolete. CRITICAL: Update "{HISTORICAL_TASK_HEADING}" to reflect the user's most recent unfulfilled input — this includes any question, decision request, or discussion turn that the assistant has not yet answered. Only write "None" if the last exchange was fully resolved.
-+Update the summary using this exact structure. MERGE, never nest: rewrite the sections from the previous summary plus the new turns — do NOT copy the previous summary verbatim into any section (especially not under "{HISTORICAL_TASK_HEADING}"), and do NOT re-log actions the previous summary already recorded; update those entries instead. ONE HOME PER FACT: each event, error, fix, and decision appears in EXACTLY ONE section — if Errors & Fixes explains a fix, Key Decisions and Resolved Questions must NOT restate it. DEGRADE nothing: keep "Completed Actions" to the last 15-20 items or only actions still affecting the current work (older resolved items become one-line entries); keep only "Resolved Questions" whose answers are still load-bearing; treat "Detailed Session Log" as a rolling window of the newest turns, not a growing archive; drop "Relevant Files" entries no longer referenced by Active State, Blocked, or the snapshot. Continue the "Completed Actions" numbering. Move items that were in progress into "Completed Actions" when done (there is no separate "In Progress" section — in-flight work belongs under "Active State"). Move answered questions to "Resolved Questions". Update "Active State" to reflect current state. Remove information only if it is clearly obsolete. TRUTH-REVISION RULE: when the new turns correct, retract, or supersede a claim the earlier turns (assistant or user) stated as fact, record ONLY the final position as fact; if the prior state is still informative, tag it "(superseded: <old>)" — a retracted claim must never survive as current fact, and a user correction outranks any earlier assistant assertion. CRITICAL: Update "{HISTORICAL_TASK_HEADING}" to reflect the user's most recent unfulfilled input — this includes any question, decision request, or discussion turn that the assistant has not yet answered. Only write "None" if the last exchange was fully resolved. Output contract: begin your reply with "{HISTORICAL_TASK_HEADING}". Output EXACTLY the section headings shown in the structure below, in the given order, each at most once, and NO other headings — fold anything from the previous summary that lived under an extra or invented heading into the closest listed section, and do NOT wrap the summary in a code fence.
++Update the summary using this exact structure. MERGE, never nest: rewrite the sections from the previous summary plus the new turns — do NOT copy the previous summary verbatim into any section (especially not under "{HISTORICAL_TASK_HEADING}"), and do NOT re-log actions the previous summary already recorded; update those entries instead. ONE HOME PER FACT: each event, error, fix, and decision appears in EXACTLY ONE section — if Errors & Fixes explains a fix, Key Decisions and Resolved Questions must NOT restate it. DEGRADE nothing: keep "Completed Actions" to the last 15-20 items or only actions still affecting the current work (older resolved items become one-line entries); keep only "Resolved Questions" whose answers are still load-bearing; treat "Detailed Session Log" as a rolling window of the newest turns, not a growing archive; drop "Relevant Files" entries no longer referenced by Active State, Blocked, or the snapshot. Continue the "Completed Actions" numbering. Move items that were in progress into "Completed Actions" when done (there is no separate "In Progress" section — in-flight work belongs under "Active State"). Move answered questions to "Resolved Questions". Update "Active State" to reflect current state. Remove information only if it is clearly obsolete. COUNTER LINE: if the previous summary contains a line starting with the bullet ⚙ Live session counters, carry that line through VERBATIM — its numbers are machine-stamped from the session database at fold time and outrank anything inferable from the turns; never re-estimate, edit, or duplicate it. TRUTH-REVISION RULE: when the new turns correct, retract, or supersede a claim the earlier turns (assistant or user) stated as fact, record ONLY the final position as fact; if the prior state is still informative, tag it "(superseded: <old>)" — a retracted claim must never survive as current fact, and a user correction outranks any earlier assistant assertion. CRITICAL: Update "{HISTORICAL_TASK_HEADING}" to reflect the user's most recent unfulfilled input — this includes any question, decision request, or discussion turn that the assistant has not yet answered. Only write "None" if the last exchange was fully resolved. Output contract: begin your reply with "{HISTORICAL_TASK_HEADING}". Output EXACTLY the section headings shown in the structure below, in the given order, each at most once, and NO other headings — fold anything from the previous summary that lived under an extra or invented heading into the closest listed section, and do NOT wrap the summary in a code fence.
  
  {_template_sections}"""
          else:
-@@ -4089,6 +4271,8 @@ Create a structured checkpoint summary for the conversation after earlier turns
+@@ -4089,6 +4326,8 @@ Create a structured checkpoint summary for the conversation after earlier turns
  TURNS TO SUMMARIZE:
  {content_to_summarize}{_memory_section}
  
@@ -281,7 +374,7 @@ index 13b1d4a08b..5672401de2 100644
  Use this exact structure:
  
  {_template_sections}"""
-@@ -4174,6 +4358,7 @@ or describe them. These markers tell the agent which skills must be reloaded bef
+@@ -4174,6 +4413,7 @@ or describe them. These markers tell the agent which skills must be reloaded bef
  use. If none appear, omit this section entirely.]
  
  Target ~{summary_budget + (_LEAN_SESSION_LOG_BUDGET_TOKENS if _session_log_section else 0)} tokens. Be CONCRETE — include file paths, command outputs, error messages, line numbers, and specific values. Avoid vague descriptions like "made some changes" — say exactly what changed.
@@ -289,7 +382,7 @@ index 13b1d4a08b..5672401de2 100644
  {_temporal_anchoring_rule}
  Write only the summary body. Do not include any preamble or prefix."""
  
-@@ -4291,6 +4476,105 @@ Write only the summary body. Do not include any preamble or prefix."""
+@@ -4291,6 +4531,105 @@ Write only the summary body. Do not include any preamble or prefix."""
              text = text[:marker_idx].rstrip()
          return text
  
@@ -396,7 +489,7 @@ index 13b1d4a08b..5672401de2 100644
      def _with_summary_prefix(cls, summary: str) -> str:
          """Normalize summary text to the current compaction handoff format."""
 diff --git a/agent/micro_compaction.py b/agent/micro_compaction.py
-index 42cad0c2d8..c9c91ae2e1 100644
+index 42cad0c2d8..1fef039336 100644
 --- a/agent/micro_compaction.py
 +++ b/agent/micro_compaction.py
 @@ -97,10 +97,12 @@ class MicroCompactionMixin:
@@ -499,6 +592,47 @@ index 42cad0c2d8..c9c91ae2e1 100644
  
      def _needs_defrag(self) -> bool:
          """Return True when the rolling summary is large enough to defrag."""
+@@ -273,6 +335,7 @@ class MicroCompactionMixin:
+ 
+         # Cumulative iff it subsumes an earlier marker; captured before summarizing.
+         _cumulative = bool(self._micro_compact_rolling_summary.strip())
++        _prev_summary = self._micro_compact_rolling_summary
+ 
+         exchange_text = self._serialize_for_summary(messages[exchange_start:exchange_end])
+         _exchange_tokens = estimate_tokens_rough(exchange_text)
+@@ -282,11 +345,29 @@ class MicroCompactionMixin:
+             _telemetry(_outcome, messages, tokens_after=_tokens_before, exchange_tokens=_exchange_tokens)
+             return messages
+ 
+-        self._micro_compact_rolling_summary = updated_summary
+-        self._micro_compact_cursor = exchange_end
+         self._reset_micro_failure_tracking()
+-
++        # Memo set before splice: the marker content renders FROM the rolling summary. Rolled back
++        # below if the measured reclaim misses the floor.
++        self._micro_compact_rolling_summary = updated_summary
+         result = self._splice_micro_compact_result(messages, exchange_start, exchange_end, supersede=_cumulative)
++
++        # Reclaim floor: each absorbed pass costs one prompt-cache break (the splice rewrites the
++        # marker and everything after it goes cold). Observed field data: savings come from the
++        # rewritten memo compacting the ACCUMULATED marker, not from exchange size (a 175-token
++        # exchange reclaimed 8,971; a 4-token one GREW the window) — so the verdict can only come
++        # from measuring, never from a size pre-gate. Commit only when the measured reclaim clears
++        # the floor; otherwise discard the merge and advance the cursor past the exchange (it stays
++        # verbatim until the batch fold, mirroring the summarize-failure bounded skip; a stuck
++        # cursor would re-summarize the same crumb every pass). Only the merge call is the sunk cost;
++        # the expensive splice+archive+cache-break never happens.
++        _floor = int(getattr(self, "_micro_compact_min_reclaim_tokens", 0) or 0)
++        if _floor > 0 and (_tokens_before - estimate_messages_tokens_rough(result)) < _floor:
++            self._micro_compact_rolling_summary = _prev_summary
++            self._micro_compact_cursor = exchange_end
++            _telemetry("reclaim_below_minimum", messages, tokens_after=_tokens_before,
++                       exchange_tokens=_exchange_tokens)
++            return messages
++
+         self._micro_compact_cursor = self._cursor_after_splice(result, exchange_start + 1)
+         if not self._sync_micro_compact_to_db(result, held=_held, start_watermark=_start_watermark):
+             # Another compaction committed during the summary call. A true no-op: returning the spliced
 -- 
 2.54.0.windows.1
 
