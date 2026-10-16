@@ -1,20 +1,41 @@
-From 46508ed99db9175128928ca0666324861bbdd6ec Mon Sep 17 00:00:00 2001
+From 3aca8d8311ce33d511574628f35b000a93fe1184 Mon Sep 17 00:00:00 2001
 From: loke <LokeLoki@users.noreply.github.com>
-Date: Thu, 15 Oct 2026 00:33:17 -0500
-Subject: [PATCH] local(v3.3-v3.4.5): compaction patch chain - adds v3.4.5
- short-heading eviction fix + mojibake scrub
+Date: Fri, 16 Oct 2026 00:07:37 -0500
+Subject: [PATCH] =?UTF-8?q?compression:=20v3.4.6=20=E2=80=94=20micro=20occ?=
+ =?UTF-8?q?upancy=20cap=20+=20reclaim-failure=20cadence=20backoff?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
 
+Adds micro_compact_max_occupancy_pct (default 0 = off): above this percent
+of the resolved context window, micro passes are skipped pre-generation —
+the fold is turns away and rewrites the whole window, so a splice there
+pays a full-window cache break for savings the fold subsumes. Also kills
+the micro->fold collision (turn-N micro beside a next-turn fold = two
+stacked cold re-prefills).
+
+Adds floor-failure backoff: a reclaim_below_minimum refusal doubles the
+cadence wait (base -> 2x -> capped at 48); an absorb or a macro fold
+resets it. Four refusals in one evening each paid full memo generation
+for zero commit.
+
+Telemetry: skipped_high_occupancy outcome; next_wait_turns on floor-
+refusal lines. Machine-stamps next_wait/cap state on fold reset.
+
+Verified: py_compile clean, behavior harness (19 assertions: cadence,
+escalation, absorb-clears, fold-reset, free-skip, every_n=1 path) PASS
+against the patched tree.
 ---
- agent/agent_init.py         |   5 +
- agent/context_compressor.py | 353 +++++++++++++++++++++++++++++++++++-
- agent/micro_compaction.py   |  95 +++++++++-
- 3 files changed, 439 insertions(+), 14 deletions(-)
+ agent/agent_init.py         |  10 +
+ agent/context_compressor.py | 362 +++++++++++++++++++++++++++++++++++-
+ agent/micro_compaction.py   | 135 +++++++++++++-
+ 3 files changed, 490 insertions(+), 17 deletions(-)
 
 diff --git a/agent/agent_init.py b/agent/agent_init.py
-index 57b84fac89..4ae36f7078 100644
+index 57b84fac89..f51a1c827a 100644
 --- a/agent/agent_init.py
 +++ b/agent/agent_init.py
-@@ -1584,6 +1584,10 @@ def _parse_compression_config(agent, _agent_cfg) -> CompressionSettings:
+@@ -1584,6 +1584,14 @@ def _parse_compression_config(agent, _agent_cfg) -> CompressionSettings:
          micro_compact_defrag_tokens=max(
              1, _parse_config_int(cfg.get("micro_compact_defrag_threshold_tokens", 2000), 2000)
          ),
@@ -22,19 +43,24 @@ index 57b84fac89..4ae36f7078 100644
 +        micro_compact_min_reclaim_tokens=max(
 +            0, _parse_config_int(cfg.get("micro_compact_min_reclaim_tokens", 0), 0)
 +        ),
++        # v3.4.6: skip micro passes at/above this percent of resolved context (0 = off).
++        micro_compact_max_occupancy_pct=max(
++            0, min(100, _parse_config_int(cfg.get("micro_compact_max_occupancy_pct", 0), 0))
++        ),
          codex_app_server_auto=app_server_auto,
          codex_responses_native=responses_native,
          codex_responses_compact_threshold=compact_threshold,
-@@ -2021,6 +2025,7 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
+@@ -2021,6 +2029,8 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
          ("_micro_compact_enabled", cs.micro_compact),
          ("_micro_compact_every_n_turns", cs.micro_compact_every_n_turns),
          ("_micro_compact_defrag_threshold_tokens", cs.micro_compact_defrag_tokens),
 +        ("_micro_compact_min_reclaim_tokens", cs.micro_compact_min_reclaim_tokens),
++        ("_micro_compact_max_occupancy_pct", cs.micro_compact_max_occupancy_pct),
      ):
          if hasattr(_cc, _attr):
              setattr(_cc, _attr, _value)
 diff --git a/agent/context_compressor.py b/agent/context_compressor.py
-index 13b1d4a08b..9bc020f925 100644
+index 13b1d4a08b..217da8ecc4 100644
 --- a/agent/context_compressor.py
 +++ b/agent/context_compressor.py
 @@ -818,6 +818,17 @@ _MIN_SUMMARY_TOKENS = 2000
@@ -85,7 +111,7 @@ index 13b1d4a08b..9bc020f925 100644
          collected.append("> " + text.replace("\n", "\n> "))
          used += len(text)
      if not collected:
-@@ -2169,6 +2184,11 @@ class ContextCompressor(
+@@ -2169,6 +2184,14 @@ class ContextCompressor(
          self._micro_compact_rolling_summary = ""
          self._micro_compact_consecutive_failures = 0
          self._micro_compact_last_failure_cursor = -1
@@ -94,10 +120,13 @@ index 13b1d4a08b..9bc020f925 100644
 +        # turns (observed: 8-pass chain fired at 42.9% occupancy, right after a fold). Post-fold,
 +        # micro's first dig must wait a full fresh cadence over the rebuilt window.
 +        self._micro_compact_turns_since_pass = 0
++        # v3.4.6: a fold restores exchange mass — any failure-backoff penalty earned pre-fold
++        # must not ride into the rebuilt window; the first post-fold probe waits the base cadence.
++        self._micro_next_wait = 0
  
      def _emit_init_summary_once(self) -> None:
          """Emit the init log line once, on first context-length resolution (keeps __init__ non-blocking)."""
-@@ -2857,6 +2877,9 @@ class ContextCompressor(
+@@ -2857,6 +2880,9 @@ class ContextCompressor(
          self._micro_compact_enabled = False
          self._reset_micro_compact_cursor_state()
          self._micro_compact_defrag_threshold_tokens = 2000
@@ -107,7 +136,20 @@ index 13b1d4a08b..9bc020f925 100644
          # Set when _defrag_rolling_summary pops _DB_PERSISTED_MARKER in place; finalize_turn resets the flush cursor.
          # Set by _defrag_rolling_summary when it pops _DB_PERSISTED_MARKER from a live dict in place;
          # consumed by finalize_turn to invalidate the agent's bounded flush-scan cursor (sibling of the
-@@ -3684,13 +3707,158 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
+@@ -2865,6 +2891,12 @@ class ContextCompressor(
+         self._micro_compact_passes = self._micro_compact_tokens_saved_total = self._micro_compact_turns_since_pass = 0
+         # Cadence dial: how often the cache-breaking pass is paid. 1 = every turn.
+         self._micro_compact_every_n_turns: int = 1
++        # v3.4.6: effective next wait, escalated by reclaim_below_minimum backoff (0 = use base
++        # cadence). Cleared on absorb and on fold (see _reset_micro_compact_cursor_state).
++        self._micro_next_wait: int = 0
++        # v3.4.6: 0 = cap off (stock). >0 = skip micro passes once the window is at/above this
++        # percent of the RESOLVED context length (fold territory; splice savings get subsumed).
++        self._micro_compact_max_occupancy_pct: int = 0
+         # Deferred: get_model_context_length() may issue a sync HTTP probe that must not block construction.
+         # Floor and cap are applied on first resolution (see _resolve_context_length / threshold_tokens).
+         # The small-context threshold floor and the absolute threshold cap both need the resolved window, so
+@@ -3684,13 +3716,158 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
              return summary
          for heading, build in (
              (_LEAN_ANCHOR_HEADING, lambda: _redact_compaction_text(_build_anchor_index(turns_to_summarize))),
@@ -267,7 +309,7 @@ index 13b1d4a08b..9bc020f925 100644
      @classmethod
      def _bound_summary_input(cls, content: str) -> str:
          """Cap total summarizer input, keeping head and tail and marking the omitted middle."""
-@@ -3974,6 +4142,60 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
+@@ -3974,6 +4151,60 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
              )
          return content
  
@@ -328,7 +370,7 @@ index 13b1d4a08b..9bc020f925 100644
      def _generate_summary(
          self, turns_to_summarize: list[dict[str, Any]], focus_topic: Optional[str] = None,
          memory_context: str = "", bypass_cooldown: bool = False,
-@@ -4019,11 +4241,26 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
+@@ -4019,11 +4250,26 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
              content = strip_think_blocks(None, content).strip() or content
              # The summarizer may echo secrets verbatim; redact the output too.
              summary = _redact_compaction_text(content.strip())
@@ -355,7 +397,7 @@ index 13b1d4a08b..9bc020f925 100644
              self._validate_summary_user_provenance(summary, has_user_turn)
              # A detached stale attempt must not publish its late summary onto shared compressor state:
              # the fallback already advanced _previous_summary and owns the cooldown/error fields. The
-@@ -4078,7 +4315,7 @@ PREVIOUS SUMMARY:
+@@ -4078,7 +4324,7 @@ PREVIOUS SUMMARY:
  NEW TURNS TO INCORPORATE:
  {content_to_summarize}{_memory_section}
  
@@ -364,7 +406,7 @@ index 13b1d4a08b..9bc020f925 100644
  
  {_template_sections}"""
          else:
-@@ -4089,6 +4326,8 @@ Create a structured checkpoint summary for the conversation after earlier turns
+@@ -4089,6 +4335,8 @@ Create a structured checkpoint summary for the conversation after earlier turns
  TURNS TO SUMMARIZE:
  {content_to_summarize}{_memory_section}
  
@@ -373,7 +415,7 @@ index 13b1d4a08b..9bc020f925 100644
  Use this exact structure:
  
  {_template_sections}"""
-@@ -4174,6 +4413,7 @@ or describe them. These markers tell the agent which skills must be reloaded bef
+@@ -4174,6 +4422,7 @@ or describe them. These markers tell the agent which skills must be reloaded bef
  use. If none appear, omit this section entirely.]
  
  Target ~{summary_budget + (_LEAN_SESSION_LOG_BUDGET_TOKENS if _session_log_section else 0)} tokens. Be CONCRETE — include file paths, command outputs, error messages, line numbers, and specific values. Avoid vague descriptions like "made some changes" — say exactly what changed.
@@ -381,7 +423,7 @@ index 13b1d4a08b..9bc020f925 100644
  {_temporal_anchoring_rule}
  Write only the summary body. Do not include any preamble or prefix."""
  
-@@ -4291,6 +4531,105 @@ Write only the summary body. Do not include any preamble or prefix."""
+@@ -4291,6 +4540,105 @@ Write only the summary body. Do not include any preamble or prefix."""
              text = text[:marker_idx].rstrip()
          return text
  
@@ -488,10 +530,21 @@ index 13b1d4a08b..9bc020f925 100644
      def _with_summary_prefix(cls, summary: str) -> str:
          """Normalize summary text to the current compaction handoff format."""
 diff --git a/agent/micro_compaction.py b/agent/micro_compaction.py
-index 42cad0c2d8..6ddbfb5902 100644
+index 42cad0c2d8..62e7b918fc 100644
 --- a/agent/micro_compaction.py
 +++ b/agent/micro_compaction.py
-@@ -97,10 +97,12 @@ class MicroCompactionMixin:
+@@ -16,6 +16,10 @@ from agent.context_compressor_telemetry import _safe_int
+ from agent.message_metadata import record_absorbed_message
+ from agent.model_metadata import estimate_messages_tokens_rough, estimate_tokens_rough
+ 
++# v3.4.6: max turns the micro cadence wait may escalate to after repeated reclaim_below_minimum
++# refusals (each probe pays memo generation; the floor commits nothing).
++_MICRO_COMPACT_BACKOFF_CEILING = 48
++
+ # Log name parity with the origin module.
+ logger = logging.getLogger("agent.context_compressor")
+ 
+@@ -97,10 +101,12 @@ class MicroCompactionMixin:
          summary_block = existing_summary if existing_summary.strip() else "(No previous summary yet.)"
          user_prompt = (
              "You are a summarization agent creating a compact record of an "
@@ -506,7 +559,7 @@ index 42cad0c2d8..6ddbfb5902 100644
              "that are no longer relevant.  Add new decisions, file paths, and "
              "open questions.\n\n"
              "NEVER include API keys, tokens, passwords, secrets, credentials, "
-@@ -108,6 +110,22 @@ class MicroCompactionMixin:
+@@ -108,6 +114,22 @@ class MicroCompactionMixin:
              f"with [REDACTED].\n\n"
              f"## Current Running Summary\n{summary_block}\n\n"
              f"## Next Exchange to Merge\n{exchange_text}\n\n"
@@ -529,7 +582,7 @@ index 42cad0c2d8..6ddbfb5902 100644
              "Return ONLY the updated summary text, no preamble or explanation. "
              "Do not include this instruction block in your output."
          )
-@@ -123,7 +141,7 @@ class MicroCompactionMixin:
+@@ -123,7 +145,7 @@ class MicroCompactionMixin:
          call_kwargs = {
              "task": "compression",
              "messages": self._build_micro_summary_prompt(self._micro_compact_rolling_summary, exchange_text),
@@ -538,7 +591,7 @@ index 42cad0c2d8..6ddbfb5902 100644
              "temperature": 0.1,
          }
          self._apply_summary_route(call_kwargs)
-@@ -159,7 +177,51 @@ class MicroCompactionMixin:
+@@ -159,7 +181,51 @@ class MicroCompactionMixin:
          if _cc()._is_refusal_response(response, content):
              logger.warning("micro-summarization returned refusal content — discarding unusable summary")
              return None
@@ -591,7 +644,50 @@ index 42cad0c2d8..6ddbfb5902 100644
  
      def _needs_defrag(self) -> bool:
          """Return True when the rolling summary is large enough to defrag."""
-@@ -273,6 +335,7 @@ class MicroCompactionMixin:
+@@ -213,11 +279,15 @@ class MicroCompactionMixin:
+             return messages
+ 
+         # Cadence gate: each pass breaks prompt cache once. Counted per invocation so a no-op turn
+-        # can't wedge it.
++        # can't wedge it. v3.4.6: the wait self-escalates after reclaim_below_minimum refusals
++        # (probe pays memo gen, floor commits nothing — repeated probes in a thin session are pure
++        # loss), and resets on an absorb or a fold (fold restores exchange mass, so a pre-fold
++        # penalty must not ride into the rebuilt window).
+         every_n = max(1, int(self._micro_compact_every_n_turns or 1))
+-        if every_n > 1:
++        wait = self._micro_next_wait if self._micro_next_wait > 1 else every_n
++        if wait > 1:
+             self._micro_compact_turns_since_pass += 1
+-            if self._micro_compact_turns_since_pass < every_n:
++            if self._micro_compact_turns_since_pass < wait:
+                 return messages
+             self._micro_compact_turns_since_pass = 0
+ 
+@@ -227,6 +297,23 @@ class MicroCompactionMixin:
+             return messages
+         exchange_start, exchange_end = exchange
+ 
++        # v3.4.6 occupancy cap: past `micro_compact_max_occupancy_pct` of the resolved window a
++        # fold is plausibly turns away, and the fold rewrites the whole window anyway — so a micro
++        # splice there pays a full-window cache-break to reclaim ~3K/turn that the fold subsumes.
++        # Skipped pre-generation: free. Telemetry-only skip (clock already reset by cadence gate).
++        _cap_pct = int(getattr(self, "_micro_compact_max_occupancy_pct", 0) or 0)
++        if _cap_pct > 0:
++            _limit = int(getattr(self, "_resolved_context_length", 0) or 0)
++            if _limit:
++                _now = estimate_messages_tokens_rough(messages)
++                if _now >= _limit * _cap_pct / 100:
++                    self._emit_micro_compaction_telemetry(
++                        outcome="skipped_high_occupancy", messages_before=n_messages,
++                        messages_after=n_messages, tokens_before=_now, tokens_after=_now,
++                        duration_ms=0, turn_session_id=turn_session_id,
++                    )
++                    return messages
++
+         # Telemetry baseline; taken only once an exchange exists so no-op turns don't pay.
+         _started_at = time.monotonic()
+         _tokens_before = estimate_messages_tokens_rough(messages)
+@@ -273,6 +360,7 @@ class MicroCompactionMixin:
  
          # Cumulative iff it subsumes an earlier marker; captured before summarizing.
          _cumulative = bool(self._micro_compact_rolling_summary.strip())
@@ -599,7 +695,7 @@ index 42cad0c2d8..6ddbfb5902 100644
  
          exchange_text = self._serialize_for_summary(messages[exchange_start:exchange_end])
          _exchange_tokens = estimate_tokens_rough(exchange_text)
-@@ -282,11 +345,29 @@ class MicroCompactionMixin:
+@@ -282,11 +370,34 @@ class MicroCompactionMixin:
              _telemetry(_outcome, messages, tokens_after=_tokens_before, exchange_tokens=_exchange_tokens)
              return messages
  
@@ -625,13 +721,43 @@ index 42cad0c2d8..6ddbfb5902 100644
 +        if _floor > 0 and (_tokens_before - estimate_messages_tokens_rough(result)) < _floor:
 +            self._micro_compact_rolling_summary = _prev_summary
 +            self._micro_compact_cursor = exchange_end
++            # v3.4.6 failure backoff: this probe paid memo gen for a zero commit. In a thin
++            # session the same crumb fails the same floor every cadence — double the next wait
++            # (capped) so repeated refusals go geometrically rarer. Resets on absorb or fold.
++            self._micro_next_wait = min(max(self._micro_next_wait, every_n) * 2,
++                                        max(every_n, _MICRO_COMPACT_BACKOFF_CEILING))
 +            _telemetry("reclaim_below_minimum", messages, tokens_after=_tokens_before,
-+                       exchange_tokens=_exchange_tokens)
++                       exchange_tokens=_exchange_tokens, next_wait_turns=self._micro_next_wait)
 +            return messages
 +
          self._micro_compact_cursor = self._cursor_after_splice(result, exchange_start + 1)
          if not self._sync_micro_compact_to_db(result, held=_held, start_watermark=_start_watermark):
              # Another compaction committed during the summary call. A true no-op: returning the spliced
+@@ -294,6 +405,7 @@ class MicroCompactionMixin:
+             self._micro_compact_cursor, self._micro_compact_rolling_summary = _pre_cursor, _pre_summary
+             _telemetry("stale_generation", messages, tokens_after=_tokens_before)
+             return messages
++        self._micro_next_wait = 0  # v3.4.6: absorb clears any backoff penalty
+         _telemetry(
+             "absorbed", result, tokens_after=estimate_messages_tokens_rough(result), exchange_tokens=_exchange_tokens,
+         )
+@@ -347,6 +459,7 @@ class MicroCompactionMixin:
+         self, *, outcome: str, messages_before: int, messages_after: int, tokens_before: int | None,
+         tokens_after: int | None, exchange_tokens: int | None = None, duration_ms: int | None = None,
+         turn_session_id: str | None = None,
++        next_wait_turns: int | None = None,
+     ) -> None:
+         """Emit one content-free JSON log line for a micro-compaction pass.
+         ``tokens_delta`` < 0 means the pass shrank the transcript; ``*_total`` fields accumulate."""
+@@ -372,6 +485,8 @@ class MicroCompactionMixin:
+                 # Headroom: how full the window is being kept.
+                 "threshold_tokens": _safe_int(threshold), "context_limit": _safe_int(self._resolved_context_length),
+                 "occupancy_pct": occupancy, "main_model": self.model or "", "aux_model": self.summary_model or "",
++                # v3.4.6: set when a floor refusal doubled the cadence wait (failure backoff).
++                **({"next_wait_turns": next_wait_turns} if next_wait_turns is not None else {}),
+             }
+             logger.info("micro compaction telemetry: %s", json.dumps(payload, sort_keys=True, separators=(",", ":")))
+             publish_micro(payload, turn_session_id=turn_session_id)
 -- 
 2.54.0.windows.1
 

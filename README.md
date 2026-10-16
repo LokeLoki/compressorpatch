@@ -1,20 +1,20 @@
-# Hermes Compaction Hardening — patch `v3.4.5`
+# Hermes Compaction Hardening — patch `v3.4.6`
 
 A drop-in patch for **Hermes Agent**'s context compressor. It fixes the
 failure modes that appear in long-running sessions (many compaction
 generations): summary snowball, section duplication, hallucinated session
 counters, and prompt-cache thrashing from micro-compaction.
 
-Built and field-tested on a single 7M-token session (~80 folds, ~37 h) — every
-knob and floor in it is calibrated against measured telemetry from that run,
-not guesses.
+Built and field-tested on a single 11M-token session (~60 h, dozens of macro
+folds) — every knob and floor in it is calibrated against measured telemetry
+from that run, not guesses.
 
 | | |
 |:---|:---|
 | **Applies to** | stock Hermes Agent at base commit `71d34bad10` (v0.21.x era) |
 | **Patch file** | [`compressorpatch.patch`](https://lokeloki.github.io/compressorpatch/compressorpatch.patch) |
-| **sha256** | `4484c7928612fb93278a7664ca35ca4ce7517d8935d1c052357fe537856e44a5` |
-| **Scope** | 3 files, 439 insertions / 14 deletions — no new dependencies |
+| **sha256** | `5960631230fcc8026f2b131cc4444df4473e4ab128f8fff01b92d2ea4ee3bfd6` |
+| **Scope** | 3 files, 490 insertions / 17 deletions — no new dependencies |
 | **Verified** | clean `git apply` at base, compiles, and passes behavior assertion suites against the patched tree |
 
 ---
@@ -25,7 +25,7 @@ Stock Hermes runs a head–torso–tail compaction loop that works well for shor
 sessions and degrades past ~10 folds, because each fold's summary is fed back
 into the next one, and micro-compaction edits the middle of the window.
 
-| Area | Stock | Patched (v3.4.5) |
+| Area | Stock | Patched (v3.4.6) |
 |:---|:---|:---|
 | **Handoff size across generations** | Unbounded. The previous summary re-feeds every fold, so summary + appendages snowball (observed ~4K → ~19K chars over 13 generations). | Hard ceiling: `min(15% of context, 10K tokens)`. Evicts oldest entries from low-priority sections first (Session Log → Completed Actions → Anchor Index), never the state sections or verbatim user block. Each eviction leaves a `session_search` pointer. |
 | **Summarizer output drift** | Models invent headings (`Next Steps`), nest the old summary inside the new one, or state the same fix in three sections. | Output contract enforced in code: unrequested headings are stripped (body kept), surviving headings canonicalized, cross-section duplicate lines deduped — all fence-aware, so code blocks are never parsed as structure. `ONE HOME PER FACT` in the prompt. |
@@ -33,6 +33,8 @@ into the next one, and micro-compaction edits the middle of the window.
 | **Session counters in the summary** | Hallucinated drift. Token/hour counts live in the protected tail, outside the summarizer's input, so a stale "5.3M tokens" copy-propagates across dozens of folds with nothing able to contradict it. | `⚙ Live session counters` line is **machine-stamped from the session DB at fold time** — exact in/out tokens, message count, elapsed hours. The model never decides these numbers; code overwrites them every fold. |
 | **Truncation amnesia** | Cut quotes and dropped bullets leave no trail. | Recovery pointers: truncated quotes and evicted entries carry the `session_id` + `session_search` breadcrumb. |
 | **Micro-compaction vs KV cache** | A micro splice can fire the turn after a big fold (two cold re-prefills stacked), the rolling memo can outgrow its own output budget, and passes fire for ~0 net savings — paying a cache break for nothing. | Rolling memo obeys the same structural contract as a batch handoff (3K ceiling); a macro fold resets the micro cadence clock; any micro pass whose **measured** reclaim falls under `micro_compact_min_reclaim_tokens` is rolled back — memo restored, no splice, no cache break, cursor advances. |
+| **Micro in fold territory** (v3.4.6) | Micros keep firing near the fold threshold. A pass at 60%+ occupancy pays a full-window cache break to reclaim ~3K/turn that the imminent fold rewrites anyway — and a turn-N micro beside a next-turn fold stacks two cold re-prefills back to back. | `micro_compact_max_occupancy_pct` (default 0 = off): at/above that percent of the resolved window the pass is skipped **pre-generation** — free. The band between the cap and the fold threshold is economically dead; the fold owns it. |
+| **Refusal storms** (v3.4.6) | A reclaim floor that keeps refusing keeps probing: every cadence the same crumb pays memo generation, refuses, commits nothing (four refusals in one evening measured). | Geometric backoff: each `reclaim_below_minimum` doubles the cadence wait (6→12→24→48 cap); an absorb or a macro fold resets it. Telemetry carries `next_wait_turns`. |
 
 ### Design principle
 
@@ -68,7 +70,7 @@ changes. **Do not use `--3way`** — conflict markers can land inside multi-line
 prompt-string constants, where Python parses them as plain text and the
 summarizer contract is silently corrupted with no crash to warn you.
 
-**Already applied an earlier hermes-compaction patch (v3.3–v3.4.4)?** Revert
+**Already applied an earlier hermes-compaction patch (v3.3–v3.4.5)?** Revert
 first — this one patch supersedes them all and is not stackable:
 
 ```bash
@@ -104,6 +106,10 @@ compression:
   micro_compact_min_reclaim_tokens: 2500        # v3.4.4; 0 = off (stock behavior).
                                                 #      Field split: passes under ~1.4K saved
                                                 #      were noise, 2.5K+ were real.
+  micro_compact_max_occupancy_pct: 60           # v3.4.6; 0 = off. Skip micro passes at/above
+                                                #      60% of the resolved window (fold
+                                                #      territory). Pair with a fold threshold
+                                                #      comfortably above the cap (here: 87%).
   context_timeout_seconds: 240                  # stock: 120; headroom under the 300s aux budget
   threshold: 0.87                               # stock: 0.50 — fold at 87% of 200K
   target_ratio: 0.45                            # stock: 0.20
@@ -134,3 +140,4 @@ Keys intentionally **not** recommended:
 | v3.4.3 | macro fold resets the micro cadence clock (no fold→micro cache-break stacking) |
 | v3.4.4 | measured reclaim floor — micro absorbs only what actually pays for its cache break |
 | v3.4.5 | section-cap eviction matches micro-short *and* macro-long headings (external-audit find) |
+| v3.4.6 | `micro_compact_max_occupancy_pct` — free pre-generation skip in fold territory (kills the micro→fold cache-break collision); geometric cadence backoff after reclaim-floor refusals; `skipped_high_occupancy` + `next_wait_turns` telemetry |
