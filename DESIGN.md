@@ -101,6 +101,20 @@ backlog clears the floor it generates **once** and splices **once** — one cach
 break for the streak instead of one per cadence tick. The window's user rows
 are re-inserted verbatim after the marker, per the micro contract.
 
+v3.4.9 keeps the bound honest: "full message tokens" means **full** — an
+assistant row making a tool call has null content with the payload in
+`tool_calls`, and a content-only sum could under-predict such a window past a
+gate it would actually pass (the bound stops being one-sided, i.e. the exact
+property the shipped comment stakes). The bound now uses the same full-message
+estimator the measured verdict uses; its side charges (stale reasoning, images)
+all point generous, so one-sidedness survives — just closer to truth. Structural
+tidying from the same audit: the gate sits **below** the defrag branch (defrag
+owns fat-summary shrink jobs and must never be gated by it), the window is
+serialized exactly **once** post-coalesce (v3.4.8 double-serialized the extend
+path), and the post-splice cursor lands past the last kept row with the
+fallback stepping past the whole kept run — the alternation merger may clone or
+merge kept dicts, so identity alone can't be the only landing path.
+
 ## 4. Cadence and interactions
 
 - **Every-N-turns** is a floor on pass frequency, not a trigger: demand-gating

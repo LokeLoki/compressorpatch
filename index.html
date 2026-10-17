@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>hermes-compaction v3.4.8 — patch artifact</title>
+<title>hermes-compaction v3.4.9 — patch artifact</title>
 <style>
   :root { color-scheme: dark; }
   body { font: 15px/1.6 ui-sans-serif, system-ui, sans-serif; margin: 0; background: #0d1117; color: #e6edf3; }
@@ -23,8 +23,8 @@
 </head>
 <body>
 <div class="wrap">
-  <h1>hermes-compaction v3.4.8</h1>
-  <div class="sub">Local patch chain for Hermes Agent's context compressor: output contract at both summary cadences, ONE-HOME dedup, handoff ceiling 10k, hardened micro-compaction, machine-stamped live session counters, fold-resets-cadence, a measured micro reclaim floor, heading-aware section caps + canonicalization map, a secondary cap tier for the middle sections, an occupancy cap that skips micros in fold territory, geometric backoff after floor refusals, and a pre-generation gate that bounds the whole pending backlog — skipping provably-dead windows for free and holding the cursor so sub-floor streaks coalesce into one splice. Three files, 603+ / 20−. Base commit <code>71d34bad10</code> (v0.21.x era).</div>
+  <h1>hermes-compaction v3.4.9</h1>
+  <div class="sub">Local patch chain for Hermes Agent's context compressor: output contract at both summary cadences, ONE-HOME dedup, handoff ceiling 10k, hardened micro-compaction, machine-stamped live session counters, fold-resets-cadence, a measured micro reclaim floor, heading-aware section caps + canonicalization map, a secondary cap tier for the middle sections, an occupancy cap that skips micros in fold territory, geometric backoff after floor refusals, and a pre-generation gate below the defrag branch that bounds the whole pending backlog over FULL message tokens — skipping provably-dead windows for free and holding the cursor so sub-floor streaks coalesce into one splice. Three files, 596+ / 23−. Base commit <code>71d34bad10</code> (v0.21.x era).</div>
   <div class="cards">
     <a class="btn" href="compressorpatch.patch" download>Download patch</a>
     <a class="btn" href="compressorpatch.patch">Raw file</a>
@@ -42,7 +42,7 @@
   micro_compact_max_occupancy_pct: 60       # v3.4.6: skip micros at/above 60% of resolved window (fold territory); 0 = off
   context_timeout_seconds: 240              # fold watchdog headroom under the 300s aux budget
   micro_compact_defrag_threshold_tokens: 20000  # leave high: memo ceiling (3000) governs first</pre>
-  <p class="meta">sha256 5fc0e736&hellip; &middot; 603 insertions / 20 deletions &middot; verified: clean <code>git apply</code> at base, compiles, behavior assertions pass against the patched tree.</p>
+  <p class="meta">sha256 de2df6d7&hellip; &middot; 596 insertions / 23 deletions &middot; verified: clean <code>git apply</code> at base, compiles, behavior assertions pass against the patched tree.</p>
   <div class="meta" id="meta"></div>
   <pre id="patch">Loading patch…</pre>
 </div>
