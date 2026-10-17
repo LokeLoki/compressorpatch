@@ -1,11 +1,11 @@
-# Hermes Compaction Hardening — patch `v3.4.7`
+# Hermes Compaction Hardening — patch `v3.4.8`
 
 A drop-in patch for **Hermes Agent**'s context compressor. It fixes the
 failure modes that appear in long-running sessions (many compaction
 generations): summary snowball, section duplication, hallucinated session
 counters, and prompt-cache thrashing from micro-compaction.
 
-Built and field-tested on a single ~14M-token session (~85 h, dozens of macro
+Built and field-tested on a single ~16.6M-token session (~100 h, dozens of macro
 folds) — every knob and floor in it is calibrated against measured telemetry
 from that run, not guesses.
 
@@ -13,8 +13,8 @@ from that run, not guesses.
 |:---|:---|
 | **Applies to** | stock Hermes Agent at base commit `71d34bad10` (v0.21.x era) |
 | **Patch file** | [`compressorpatch.patch`](https://lokeloki.github.io/compressorpatch/compressorpatch.patch) |
-| **sha256** | `c3df7d6b5a7f239e28198e781294ae6605f6fd8f1b91a58c43b9f6d428d0692c` |
-| **Scope** | 3 files, 508 insertions / 17 deletions — no new dependencies |
+| **sha256** | `5fc0e736308d9b960dfdd9eed4aaa94aed72c4f019616fe71954bf640a582273` |
+| **Scope** | 3 files, 603 insertions / 20 deletions — no new dependencies |
 | **Verified** | clean `git apply` at base, compiles, and passes behavior assertion suites against the patched tree |
 
 ---
@@ -27,7 +27,7 @@ into the next one, and micro-compaction edits the middle of the window.
 
 | Area | Stock | Patched |
 |:---|:---|:---|
-| **Handoff size across generations** | Unbounded. The previous summary re-feeds every fold, so summary + appendages snowball (observed ~4K → ~19K chars over 13 generations). | Hard ceiling: `min(15% of context, 10K tokens)`. Evicts oldest entries from low-priority sections first (Session Log → Completed Actions → Anchor Index), never the state sections or verbatim user block. Each eviction leaves a `session_search` pointer. |
+| **Handoff size across generations** | Unbounded. The previous summary re-feeds every fold, so summary + appendages snowball (observed ~4K → ~19K chars over 13 generations). | Hard ceiling: `min(15% of context, 10K tokens)`. Evicts oldest entries from low-priority sections first (Session Log → Completed Actions → Anchor Index), never the state sections or verbatim user block. v3.4.8 secondary tier (only if the primary trio empties and the handoff is still over ceiling): partial trims that keep the newest Resolved Questions (5) / Relevant Files (10) / Errors & Fixes (6). Each eviction leaves a `session_search` pointer. |
 | **Summarizer output drift** | Models invent headings (`Next Steps`), nest the old summary inside the new one, or state the same fix in three sections. | Output contract enforced in code: unrequested headings are stripped (body kept), surviving headings canonicalized, cross-section duplicate lines deduped — all fence-aware, so code blocks are never parsed as structure. `ONE HOME PER FACT` in the prompt. |
 | **Contradictions & retractions** | An early wrong guess stays recorded as fact forever. | Truth-revision rule: corrections outrank earlier assertions; superseded claims are dropped or tagged `(superseded: <old>)`. |
 | **Session counters in the summary** | Hallucinated drift. Token/hour counts live in the protected tail, outside the summarizer's input, so a stale "5.3M tokens" copy-propagates across dozens of folds with nothing able to contradict it. | `⚙ Live session counters` line is **machine-stamped from the session DB at fold time** — exact in/out tokens, message count, elapsed hours. The model never decides these numbers; code overwrites them every fold. |
@@ -35,7 +35,7 @@ into the next one, and micro-compaction edits the middle of the window.
 | **Micro-compaction vs KV cache** | A micro splice can fire the turn after a big fold (two cold re-prefills stacked), the rolling memo can outgrow its own output budget, and passes fire for ~0 net savings — paying a cache break for nothing. | Rolling memo obeys the same structural contract as a batch handoff (3K ceiling); a macro fold resets the micro cadence clock; any micro pass whose **measured** reclaim falls under `micro_compact_min_reclaim_tokens` is rolled back — memo restored, no splice, no cache break, cursor advances. |
 | **Micro in fold territory** (v3.4.6) | Micros keep firing near the fold threshold. A pass at 60%+ occupancy pays a full-window cache break to reclaim ~3K/turn that the imminent fold rewrites anyway — and a turn-N micro beside a next-turn fold stacks two cold re-prefills back to back. | `micro_compact_max_occupancy_pct` (default 0 = off): at/above that percent of the resolved window the pass is skipped **pre-generation** — free. The band between the cap and the fold threshold is economically dead; the fold owns it. |
 | **Refusal storms** (v3.4.6) | A reclaim floor that keeps refusing keeps probing: every cadence the same crumb pays memo generation, refuses, commits nothing (four refusals in one evening measured). | Geometric backoff: each `reclaim_below_minimum` doubles the cadence wait (6→12→24→48 cap); an absorb or a macro fold resets it. Telemetry carries `next_wait_turns`. |
-| **Paid probes on dead windows** (v3.4.7) | The floor catches sub-floor reclaims *after* the merge — so every guaranteed-losing pass still pays memo generation. Prefill costs nothing by comparison; the generation is the tax. | Pre-generation gate: if `exchange_tokens + rolling_summary_tokens` can't clear the floor even at best case (whole exchange absorbed AND summary shrinks to nothing), skip before the model call — free, same cursor-advance + backoff as a floor failure. Provably one-sided: it can only skip runs that cannot pass the floor, so real wins (fat-summary shrink jobs) still generate. Telemetry: `skipped_pre_gate`. |
+| **Paid probes on dead windows** (v3.4.7) | The floor catches sub-floor reclaims *after* the merge — so every guaranteed-losing pass still pays memo generation. Prefill costs nothing by comparison; the generation is the tax. | Pre-generation gate: if the pending backlog's best case (`exchange_tokens + rolling_summary_tokens`) can't clear the floor even with the whole exchange absorbed AND the summary shrinking to nothing, skip before the model call — free. Provably one-sided: it can only skip runs that cannot pass the floor, so real wins (fat-summary shrink jobs) still generate. v3.4.8: the bound covers the whole pending backlog, and a skip **holds the cursor** so a streak of sub-floor exchanges accumulates into ONE generation + splice (one cache break); backoff as before. Telemetry: `skipped_pre_gate`. |
 
 ### Design principle
 
@@ -146,3 +146,4 @@ Keys intentionally **not** recommended:
 | v3.4.5 | section-cap eviction matches micro-short *and* macro-long headings (external-audit find) |
 | v3.4.6 | `micro_compact_max_occupancy_pct` — free pre-generation skip in fold territory (kills the micro→fold cache-break collision); geometric cadence backoff after reclaim-floor refusals; `skipped_high_occupancy` + `next_wait_turns` telemetry |
 | v3.4.7 | pre-generation floor gate — a window whose best-case reclaim can't clear the floor is skipped before the memo call (free); floor raised 2500→2700 on field telemetry; `skipped_pre_gate` telemetry; two behavior tests |
+| v3.4.8 | external-audit fixes: heading canonicalization map (short variants fold to canonical headings before dedup/cap run, so Pass 1 merges and the cap's prefix match can't miss); secondary cap tier for the middle sections (Resolved Questions keep 5 → Relevant Files keep 10 → Errors & Fixes keep 6) when the primary trio empties over ceiling; pre-gen gate now bounds the WHOLE pending backlog and holds the cursor on a dead-window skip, so a streak of sub-floor exchanges accumulates into ONE generation + splice (one cache break) — four new behavior tests |

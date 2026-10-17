@@ -93,6 +93,14 @@ thin memo) are never predicted dead and still generate. Everything cheaper
 than the memo call is free to gate; the memo call itself is where the measured
 verdict resumes.
 
+v3.4.8 widens the gate's sight: the bound is computed over the **whole pending
+backlog**, not just the next exchange — still one-sided (a bigger window is a
+more generous bound, so provability holds). On a skip the cursor is now
+**held**, so a streak of sub-floor exchanges accumulates; when the accumulated
+backlog clears the floor it generates **once** and splices **once** — one cache
+break for the streak instead of one per cadence tick. The window's user rows
+are re-inserted verbatim after the marker, per the micro contract.
+
 ## 4. Cadence and interactions
 
 - **Every-N-turns** is a floor on pass frequency, not a trigger: demand-gating
@@ -124,6 +132,9 @@ verdict resumes.
 3. Heading matching must handle **short and long heading variants** — the cap
    pass used the long canonical prefix and silently could not evict the
    micro contract's short `## Anchor Index` (v3.4.5, external-audit find).
+   v3.4.8 fixes it at the root: a canonicalization map folds the short variants
+   to the exact canonical headings *before* dedup and cap run, so Pass 1 merges
+   them and the cap's prefix match can never miss.
 4. Cap-before-commit for anything that re-feeds a future prompt: the handoff
    snowballs precisely because it is the input of the next generation
    (observed 4K → 19K chars over 13 generations, no ceiling).
