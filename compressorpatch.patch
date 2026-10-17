@@ -1,36 +1,3 @@
-From 3aca8d8311ce33d511574628f35b000a93fe1184 Mon Sep 17 00:00:00 2001
-From: loke <LokeLoki@users.noreply.github.com>
-Date: Fri, 16 Oct 2026 00:07:37 -0500
-Subject: [PATCH] =?UTF-8?q?compression:=20v3.4.6=20=E2=80=94=20micro=20occ?=
- =?UTF-8?q?upancy=20cap=20+=20reclaim-failure=20cadence=20backoff?=
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-Adds micro_compact_max_occupancy_pct (default 0 = off): above this percent
-of the resolved context window, micro passes are skipped pre-generation —
-the fold is turns away and rewrites the whole window, so a splice there
-pays a full-window cache break for savings the fold subsumes. Also kills
-the micro->fold collision (turn-N micro beside a next-turn fold = two
-stacked cold re-prefills).
-
-Adds floor-failure backoff: a reclaim_below_minimum refusal doubles the
-cadence wait (base -> 2x -> capped at 48); an absorb or a macro fold
-resets it. Four refusals in one evening each paid full memo generation
-for zero commit.
-
-Telemetry: skipped_high_occupancy outcome; next_wait_turns on floor-
-refusal lines. Machine-stamps next_wait/cap state on fold reset.
-
-Verified: py_compile clean, behavior harness (19 assertions: cadence,
-escalation, absorb-clears, fold-reset, free-skip, every_n=1 path) PASS
-against the patched tree.
----
- agent/agent_init.py         |  10 +
- agent/context_compressor.py | 362 +++++++++++++++++++++++++++++++++++-
- agent/micro_compaction.py   | 135 +++++++++++++-
- 3 files changed, 490 insertions(+), 17 deletions(-)
-
 diff --git a/agent/agent_init.py b/agent/agent_init.py
 index 57b84fac89..f51a1c827a 100644
 --- a/agent/agent_init.py
@@ -530,7 +497,7 @@ index 13b1d4a08b..217da8ecc4 100644
      def _with_summary_prefix(cls, summary: str) -> str:
          """Normalize summary text to the current compaction handoff format."""
 diff --git a/agent/micro_compaction.py b/agent/micro_compaction.py
-index 42cad0c2d8..62e7b918fc 100644
+index 42cad0c2d8..39a356551d 100644
 --- a/agent/micro_compaction.py
 +++ b/agent/micro_compaction.py
 @@ -16,6 +16,10 @@ from agent.context_compressor_telemetry import _safe_int
@@ -687,7 +654,7 @@ index 42cad0c2d8..62e7b918fc 100644
          # Telemetry baseline; taken only once an exchange exists so no-op turns don't pay.
          _started_at = time.monotonic()
          _tokens_before = estimate_messages_tokens_rough(messages)
-@@ -273,6 +360,7 @@ class MicroCompactionMixin:
+@@ -273,20 +360,62 @@ class MicroCompactionMixin:
  
          # Cumulative iff it subsumes an earlier marker; captured before summarizing.
          _cumulative = bool(self._micro_compact_rolling_summary.strip())
@@ -695,7 +662,25 @@ index 42cad0c2d8..62e7b918fc 100644
  
          exchange_text = self._serialize_for_summary(messages[exchange_start:exchange_end])
          _exchange_tokens = estimate_tokens_rough(exchange_text)
-@@ -282,11 +370,34 @@ class MicroCompactionMixin:
++
++        # v3.4.7 pre-generation gate: a run whose BEST-CASE reclaim (whole exchange vanishes AND
++        # whole summary shrinks to nothing) can't clear the floor is dead before the model call —
++        # skip free. One-sided bound: it can never skip a run that could pass the floor, so real
++        # wins (fat-summary shrink jobs, handled by defrag upstream) still generate. Same
++        # cursor-advance + backoff as a floor failure: the same crumb fails the same gate.
++        _pre_gate_floor = int(getattr(self, "_micro_compact_min_reclaim_tokens", 0) or 0)
++        if _pre_gate_floor > 0 and (_exchange_tokens + estimate_tokens_rough(
++                self._micro_compact_rolling_summary)) < _pre_gate_floor:
++            self._micro_compact_cursor = exchange_end
++            self._micro_next_wait = min(max(self._micro_next_wait, every_n) * 2,
++                                        max(every_n, _MICRO_COMPACT_BACKOFF_CEILING))
++            _telemetry("skipped_pre_gate", messages, tokens_after=_tokens_before,
++                       exchange_tokens=_exchange_tokens, next_wait_turns=self._micro_next_wait)
++            return messages
++
+         updated_summary = self._micro_summarize_one(exchange_text)
+         if updated_summary is None:
+             _outcome = self._record_micro_failure(exchange_start, exchange_end)
              _telemetry(_outcome, messages, tokens_after=_tokens_before, exchange_tokens=_exchange_tokens)
              return messages
  
@@ -712,7 +697,9 @@ index 42cad0c2d8..62e7b918fc 100644
 +        # marker and everything after it goes cold). Observed field data: savings come from the
 +        # rewritten memo compacting the ACCUMULATED marker, not from exchange size (a 175-token
 +        # exchange reclaimed 8,971; a 4-token one GREW the window) — so the verdict can only come
-+        # from measuring, never from a size pre-gate. Commit only when the measured reclaim clears
++        # from measuring, never from a size pre-gate (v3.4.7's pre-generation gate skips only runs
++        # that are mathematically dead — it can never skip a run that could pass the floor).
++        # Commit only when the measured reclaim clears
 +        # the floor; otherwise discard the merge and advance the cursor past the exchange (it stays
 +        # verbatim until the batch fold, mirroring the summarize-failure bounded skip; a stuck
 +        # cursor would re-summarize the same crumb every pass). Only the merge call is the sunk cost;
@@ -733,7 +720,7 @@ index 42cad0c2d8..62e7b918fc 100644
          self._micro_compact_cursor = self._cursor_after_splice(result, exchange_start + 1)
          if not self._sync_micro_compact_to_db(result, held=_held, start_watermark=_start_watermark):
              # Another compaction committed during the summary call. A true no-op: returning the spliced
-@@ -294,6 +405,7 @@ class MicroCompactionMixin:
+@@ -294,6 +423,7 @@ class MicroCompactionMixin:
              self._micro_compact_cursor, self._micro_compact_rolling_summary = _pre_cursor, _pre_summary
              _telemetry("stale_generation", messages, tokens_after=_tokens_before)
              return messages
@@ -741,7 +728,7 @@ index 42cad0c2d8..62e7b918fc 100644
          _telemetry(
              "absorbed", result, tokens_after=estimate_messages_tokens_rough(result), exchange_tokens=_exchange_tokens,
          )
-@@ -347,6 +459,7 @@ class MicroCompactionMixin:
+@@ -347,6 +477,7 @@ class MicroCompactionMixin:
          self, *, outcome: str, messages_before: int, messages_after: int, tokens_before: int | None,
          tokens_after: int | None, exchange_tokens: int | None = None, duration_ms: int | None = None,
          turn_session_id: str | None = None,
@@ -749,7 +736,7 @@ index 42cad0c2d8..62e7b918fc 100644
      ) -> None:
          """Emit one content-free JSON log line for a micro-compaction pass.
          ``tokens_delta`` < 0 means the pass shrank the transcript; ``*_total`` fields accumulate."""
-@@ -372,6 +485,8 @@ class MicroCompactionMixin:
+@@ -372,6 +503,8 @@ class MicroCompactionMixin:
                  # Headroom: how full the window is being kept.
                  "threshold_tokens": _safe_int(threshold), "context_limit": _safe_int(self._resolved_context_length),
                  "occupancy_pct": occupancy, "main_model": self.model or "", "aux_model": self.summary_model or "",
@@ -758,6 +745,3 @@ index 42cad0c2d8..62e7b918fc 100644
              }
              logger.info("micro compaction telemetry: %s", json.dumps(payload, sort_keys=True, separators=(",", ":")))
              publish_micro(payload, turn_session_id=turn_session_id)
--- 
-2.54.0.windows.1
-

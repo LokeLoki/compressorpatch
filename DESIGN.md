@@ -79,8 +79,19 @@ no splice, no cache break, cursor advances past the crumb — no re-summarize
 loop).
 
 The savings split has a clean valley: ≤1,409 were noise/negative, ≥2,638 were
-real. Hence `micro_compact_min_reclaim_tokens: 2500`. On a different harness
+real. Hence `micro_compact_min_reclaim_tokens: 2500` (field floor at the time;
+the running box now operates at **2700**, set alongside v3.4.7's gate — the
+valley's exact depth is harness-specific, as always). On a different harness
 or window, re-measure the valley — don't copy the constant; copy the method.
+
+v3.4.7 adds the one exception to "never predict before measuring": the
+**pre-generation gate**, which skips a window only when the *best case* —
+whole exchange absorbed AND the summary shrinking to nothing — still can't
+clear the floor. That bound is one-sided and provable, so it can never skip a
+run that could pass the floor; genuine winners (a fat summary collapsing to a
+thin memo) are never predicted dead and still generate. Everything cheaper
+than the memo call is free to gate; the memo call itself is where the measured
+verdict resumes.
 
 ## 4. Cadence and interactions
 
